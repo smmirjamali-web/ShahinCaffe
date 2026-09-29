@@ -19,5 +19,5 @@ class DiscountCodeDetailSerializer(serializers.ModelSerializer):
 class DiscountCodeUsageSerializer(serializers.ModelSerializer):
     class Meta:
         model = DiscountCodeUsage
-        fields = ['id', 'discount_code', 'user', 'guest_phone', 'order', 
+        fields = ['id', 'discount_code', 'user', 'guest_phone', 'order_id', 
                   'discount_amount', 'used_at']
