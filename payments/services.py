@@ -1,102 +1,239 @@
+from django.db import transaction as db_transaction
+from django.utils import timezone
+
 from .models import PaymentTransaction, PaymentGatewayConfig
 from .zarinpal_gateway import ZarinpalGateway
 from orders.models import Order
-from django.utils import timezone
 
-def initiate_payment(order_id, gateway_name, callback_url, customer_email='', customer_phone=''):
-    """شروع فرآیند پرداخت"""
+
+def initiate_payment(
+    order_id,
+    gateway_name,
+    callback_url,
+    customer_email='',
+    customer_phone='',
+):
+    """شروع فرآیند پرداخت سفارش."""
+
     try:
         order = Order.objects.get(id=order_id)
+
     except Order.DoesNotExist:
-        return {'success': False, 'error': 'سفارش یافت نشد'}
-    
+        return {
+            'success': False,
+            'error': 'سفارش یافت نشد.',
+        }
+
+    if order.payment_status == 'paid':
+        return {
+            'success': False,
+            'error': 'این سفارش قبلاً پرداخت شده است.',
+        }
+
+    if order.total_amount <= 0:
+        return {
+            'success': False,
+            'error': 'مبلغ سفارش برای پرداخت معتبر نیست.',
+        }
+
     try:
         gateway_config = PaymentGatewayConfig.objects.get(
             gateway_name=gateway_name,
-            is_active=True
+            is_active=True,
         )
+
     except PaymentGatewayConfig.DoesNotExist:
-        return {'success': False, 'error': 'درگاه پرداخت فعال نیست'}
-    
-    if gateway_name == 'zarinpal':
-        gateway = ZarinpalGateway()
-        
-        if not customer_phone:
-            customer_phone = order.get_customer_phone()
-        
-        result = gateway.request_payment(
-            order.total_amount,
-            order.id,
-            customer_email,
-            customer_phone,
-            callback_url
-        )
-        
-        if result['success']:
-            # ثبت تراکنش
-            transaction = PaymentTransaction.objects.create(
-                order=order,
-                gateway='zarinpal',
-                reference_id=result['authority'],
-                amount=order.total_amount,
-                status='pending',
-                customer_phone=customer_phone,
-                customer_email=customer_email
+        return {
+            'success': False,
+            'error': 'درگاه پرداخت فعال نیست.',
+        }
+
+    if gateway_name != 'zarinpal':
+        return {
+            'success': False,
+            'error': 'درگاه پرداخت پشتیبانی نشده است.',
+        }
+
+    gateway = ZarinpalGateway()
+
+    if not customer_phone:
+        customer_phone = order.get_customer_phone() or ''
+
+    if not customer_phone:
+        return {
+            'success': False,
+            'error': 'شماره تلفن مشتری مشخص نیست.',
+        }
+
+    result = gateway.request_payment(
+        order.total_amount,
+        order.id,
+        customer_email,
+        customer_phone,
+        callback_url,
+    )
+
+    if not result['success']:
+        return {
+            'success': False,
+            'error': result.get(
+                'error',
+                'خطا در ایجاد درخواست پرداخت.',
+            ),
+        }
+
+    payment_transaction = PaymentTransaction.objects.create(
+        order=order,
+        gateway=gateway_name,
+        reference_id=result['authority'],
+        amount=order.total_amount,
+        status='pending',
+        customer_phone=customer_phone,
+        customer_email=customer_email,
+    )
+
+    return {
+        'success': True,
+        'transaction_id': payment_transaction.id,
+        'authority': result['authority'],
+        'payment_url': result['payment_url'],
+    }
+
+
+def verify_payment(authority, amount=None):
+    """
+    تأیید پرداخت با استفاده از مبلغ ذخیره‌شده در دیتابیس.
+
+    مبلغ دریافتی از callback مبنای تأیید نیست.
+    """
+
+    if not authority:
+        return {
+            'success': False,
+            'error': 'شناسه پرداخت الزامی است.',
+        }
+
+    with db_transaction.atomic():
+
+        try:
+            payment_transaction = (
+                PaymentTransaction.objects
+                .select_for_update()
+                .select_related('order')
+                .get(reference_id=authority)
             )
-            
-            return {
-                'success': True,
-                'transaction_id': transaction.id,
-                'authority': result['authority'],
-                'payment_url': result['payment_url']
-            }
-        else:
+
+        except PaymentTransaction.DoesNotExist:
             return {
                 'success': False,
-                'error': result['error']
+                'error': 'تراکنش پرداخت یافت نشد.',
             }
-    
-    return {'success': False, 'error': 'درگاه پرداخت پشتیبانی نشده'}
 
+        # اگر قبلاً تأیید شده، نتیجه موفق قبلی را برگردان.
+        # این کار از پردازش مجدد callback موفق جلوگیری می‌کند.
+        if payment_transaction.status == 'success':
+            gateway_response = (
+                payment_transaction.gateway_response or {}
+            )
 
-def verify_payment(authority, amount):
-    """تایید پرداخت"""
-    try:
-        transaction = PaymentTransaction.objects.get(
-            reference_id=authority,
-            status='pending'
-        )
-    except PaymentTransaction.DoesNotExist:
-        return {'success': False, 'error': 'تراکنش یافت نشد'}
-    
-    if transaction.gateway == 'zarinpal':
-        gateway = ZarinpalGateway()
-        result = gateway.verify_payment(authority, int(amount))
-        
-        if result['success']:
-            # به‌روزرسانی تراکنش
-            transaction.status = 'success'
-            transaction.verified_at = timezone.now()
-            transaction.gateway_response = {'ref_id': result['ref_id']}
-            transaction.save()
-            
-            # به‌روزرسانی سفارش
-            order = transaction.order
-            order.payment_status = 'paid'
-            order.save()
-            
-            # ارسال اطلاع‌رسانی
-            from notifications.services import send_order_notification
-            send_order_notification.delay(order.id, 'payment_received')
-            
             return {
                 'success': True,
-                'ref_id': result['ref_id'],
-                'order_id': order.id
+                'ref_id': gateway_response.get('ref_id'),
+                'order_id': payment_transaction.order_id,
+                'already_verified': True,
             }
-        else:
-            transaction.status = 'failed'
-            transaction.save()
-            return {'success': False, 'error': result['error']}
-    
-    return {'success': False, 'error': 'درگاه پرداخت پشتیبانی نشده'}
+
+        if payment_transaction.status != 'pending':
+            return {
+                'success': False,
+                'error': 'این تراکنش در وضعیت قابل تأیید نیست.',
+            }
+
+        if payment_transaction.gateway != 'zarinpal':
+            return {
+                'success': False,
+                'error': 'درگاه پرداخت پشتیبانی نشده است.',
+            }
+
+        # مبلغ معتبر از رکورد ذخیره‌شده در دیتابیس گرفته می‌شود.
+        trusted_amount = payment_transaction.amount
+
+        gateway = ZarinpalGateway()
+
+        result = gateway.verify_payment(
+            authority,
+            int(trusted_amount),
+        )
+
+        if not result['success']:
+            payment_transaction.status = 'failed'
+            payment_transaction.error_message = result.get(
+                'error',
+                'تأیید پرداخت ناموفق بود.',
+            )
+
+            payment_transaction.save(
+                update_fields=[
+                    'status',
+                    'error_message',
+                ]
+            )
+
+            return {
+                'success': False,
+                'error': payment_transaction.error_message,
+            }
+
+        # ثبت نتیجه موفق پرداخت
+        payment_transaction.status = 'success'
+        payment_transaction.verified_at = timezone.now()
+        payment_transaction.gateway_response = {
+            'ref_id': result['ref_id'],
+            'card_hash': result.get('card_hash', ''),
+        }
+
+        payment_transaction.save(
+            update_fields=[
+                'status',
+                'verified_at',
+                'gateway_response',
+            ]
+        )
+
+        # تغییر وضعیت سفارش تنها پس از تأیید درگاه
+        order = payment_transaction.order
+
+        if order.payment_status != 'paid':
+            order.payment_status = 'paid'
+
+            order.save(
+                update_fields=[
+                    'payment_status',
+                    'updated_at',
+                ]
+            )
+
+            # اعلان فقط پس از ثبت موفق تراکنش در دیتابیس ارسال شود.
+            db_transaction.on_commit(
+                lambda order_id=order.id: (
+                    _send_payment_notification(order_id)
+                )
+            )
+
+        return {
+            'success': True,
+            'ref_id': result['ref_id'],
+            'order_id': order.id,
+            'already_verified': False,
+        }
+
+
+def _send_payment_notification(order_id):
+    """ارسال اعلان پرداخت پس از ثبت تراکنش."""
+
+    from notifications.services import send_order_notification
+
+    send_order_notification.delay(
+        order_id,
+        'payment_received',
+    )
