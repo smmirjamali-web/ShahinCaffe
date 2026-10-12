@@ -206,11 +206,11 @@ class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if payment_status != 'OK':
+        if payment_status not in ('OK', 'NOK'):
             return Response(
                 {
                     'success': False,
-                    'error': 'پرداخت توسط کاربر لغو شده یا موفق نبوده است.',
+                    'error': 'وضعیت بازگشتی درگاه معتبر نیست.',
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )

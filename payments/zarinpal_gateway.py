@@ -84,6 +84,10 @@ class ZarinpalGateway:
         if not response.ok:
             return {
                 'success': False,
+                'retryable': (
+                        response.status_code == 429
+                        or response.status_code >= 500
+                ),
                 'error': 'درگاه پرداخت درخواست را نپذیرفت.',
             }
 
@@ -115,12 +119,14 @@ class ZarinpalGateway:
         if not self.merchant_id:
             return {
                 'success': False,
+                'retryable': False,
                 'error': 'شناسه پذیرنده درگاه تنظیم نشده است.',
             }
 
         if not authority or int(amount) <= 0:
             return {
                 'success': False,
+                'retryable': False,
                 'error': 'شناسه یا مبلغ پرداخت معتبر نیست.',
             }
 
@@ -136,41 +142,80 @@ class ZarinpalGateway:
                 json=data,
                 timeout=15,
             )
-
-            result = response.json()
-
         except requests.RequestException:
             return {
                 'success': False,
+                'retryable': True,
                 'error': 'ارتباط با درگاه برای تأیید پرداخت برقرار نشد.',
             }
 
+        try:
+            result = response.json()
         except ValueError:
             return {
                 'success': False,
+                'retryable': True,
                 'error': 'پاسخ تأیید درگاه معتبر نیست.',
             }
 
         if not response.ok:
+            is_retryable = (
+                    response.status_code == 429
+                    or response.status_code >= 500
+            )
+
             return {
                 'success': False,
+                'retryable': is_retryable,
                 'error': 'درگاه پرداخت را تأیید نکرد.',
             }
 
-        gateway_data = result.get('data') or {}
+        if not isinstance(result, dict):
+            return {
+                'success': False,
+                'retryable': True,
+                'error': 'ساختار پاسخ درگاه معتبر نیست.',
+            }
+
+        gateway_data = result.get('data')
+
+        if not isinstance(gateway_data, dict):
+            # خطای ساختاریافته درگاه معمولاً نشان‌دهنده
+            # رد درخواست است، نه صرفاً قطع ارتباط.
+            if isinstance(result.get('errors'), dict):
+                return {
+                    'success': False,
+                    'retryable': False,
+                    'error': 'درگاه درخواست تأیید را نپذیرفت.',
+                }
+
+            return {
+                'success': False,
+                'retryable': True,
+                'error': 'اطلاعات تأیید دریافتی از درگاه معتبر نیست.',
+            }
+
         gateway_code = gateway_data.get('code')
 
         if gateway_code in [100, 101]:
+            ref_id = gateway_data.get('ref_id')
+
+            if not ref_id:
+                return {
+                    'success': False,
+                    'retryable': True,
+                    'error': 'کد رهگیری در پاسخ تأیید درگاه وجود ندارد.',
+                }
+
             return {
                 'success': True,
-                'ref_id': gateway_data.get('ref_id'),
-                'card_hash': gateway_data.get(
-                    'card_hash',
-                    '',
-                ),
+                'retryable': False,
+                'ref_id': ref_id,
+                'card_hash': gateway_data.get('card_hash', ''),
             }
 
         return {
             'success': False,
+            'retryable': False,
             'error': 'تأیید پرداخت توسط درگاه ناموفق بود.',
         }

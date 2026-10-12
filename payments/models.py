@@ -41,8 +41,13 @@ class PaymentTransaction(models.Model):
                              verbose_name="سفارش")
     
     gateway = models.CharField(max_length=50, verbose_name="درگاه پرداخت")
-    reference_id = models.CharField(max_length=200, unique=True,
-                                   verbose_name="شماره ارجاع درگاه")
+    reference_id = models.CharField(
+        max_length=200,
+        unique=True,
+        null=True,
+        blank=True,
+        verbose_name="شماره ارجاع درگاه",
+    )
     
     amount = models.DecimalField(max_digits=12, decimal_places=0,
                                 verbose_name="مبلغ (تومان)")
@@ -64,7 +69,11 @@ class PaymentTransaction(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     verified_at = models.DateTimeField(null=True, blank=True,
                                       verbose_name="زمان تایید")
-    
+    verification_started_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="زمان شروع تأیید",
+    )
     error_message = models.TextField(blank=True, verbose_name="پیام خطا")
     
     class Meta:
@@ -75,6 +84,13 @@ class PaymentTransaction(models.Model):
             models.Index(fields=['order', '-created_at']),
             models.Index(fields=['status']),
         ]
-    
+        constraints = [
+            models.UniqueConstraint(
+                fields=['order'],
+                condition=models.Q(status='pending'),
+                name='unique_pending_payment_per_order',
+            ),
+        ]
+
     def __str__(self):
         return f"تراکنش {self.reference_id} - {self.amount} تومان"

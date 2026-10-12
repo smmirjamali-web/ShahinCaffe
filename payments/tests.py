@@ -13,8 +13,7 @@ from payments.models import (
     PaymentGatewayConfig,
     PaymentTransaction,
 )
-from payments.services import verify_payment
-
+from payments.services import initiate_payment, verify_payment
 
 class PaymentAPITests(TestCase):
     """تست دسترسی کاربران به API پرداخت."""
@@ -174,6 +173,34 @@ class PaymentAPITests(TestCase):
             status.HTTP_400_BAD_REQUEST,
         )
 
+    @patch('payments.views.verify_payment')
+    def test_callback_verifies_gateway_even_when_status_is_nok(
+        self,
+        mock_verify,
+    ):
+        mock_verify.return_value = {
+            'success': True,
+            'ref_id': 'REF-CALLBACK-123',
+            'order_id': self.order_a.id,
+            'already_verified': False,
+        }
+
+        response = self.client.get(
+            reverse('transaction-callback'),
+            {
+                'Authority': 'AUTH-TEST-A',
+                'Status': 'NOK',
+            },
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        mock_verify.assert_called_once_with(
+            'AUTH-TEST-A',
+        )
 
 class VerifyPaymentServiceTests(TestCase):
     """تست تأیید پرداخت بدون تماس با درگاه واقعی."""
@@ -277,3 +304,175 @@ class VerifyPaymentServiceTests(TestCase):
             'AUTH-VERIFY-TEST',
             50000,
         )
+
+
+class InitiatePaymentServiceTests(TestCase):
+    """تست شروع پرداخت و جلوگیری از درخواست تکراری."""
+
+    def setUp(self):
+        self.user = CustomUser.objects.create_user(
+            phone_number='09120000024',
+            password='UserPass123!',
+        )
+
+        self.callback_url = (
+            'https://example.com/api/payments/transactions/callback/'
+        )
+
+        PaymentGatewayConfig.objects.create(
+            gateway_name='zarinpal',
+            merchant_id='test-merchant-id',
+            api_key='test-api-key',
+            callback_url=self.callback_url,
+        )
+
+        self.order = Order.objects.create(
+            user=self.user,
+            delivery_method='delivery',
+            delivery_address='Test Street',
+            total_amount=Decimal('50000'),
+        )
+
+    @patch('payments.services.ZarinpalGateway.request_payment')
+    def test_initiation_creates_pending_transaction(
+        self,
+        mock_request,
+    ):
+        mock_request.return_value = {
+            'success': True,
+            'authority': 'AUTH-START-TEST',
+            'payment_url': (
+                'https://www.zarinpal.com/pg/StartPay/'
+                'AUTH-START-TEST'
+            ),
+        }
+
+        result = initiate_payment(
+            order_id=self.order.id,
+            gateway_name='zarinpal',
+            callback_url=self.callback_url,
+            customer_email='',
+            customer_phone=self.user.phone_number,
+        )
+
+        self.assertTrue(result['success'])
+
+        payment = PaymentTransaction.objects.get(
+            order=self.order,
+        )
+
+        self.assertEqual(payment.status, 'pending')
+        self.assertEqual(
+            payment.reference_id,
+            'AUTH-START-TEST',
+        )
+
+        mock_request.assert_called_once()
+
+    @patch('payments.services.ZarinpalGateway.request_payment')
+    def test_second_initiation_is_rejected_while_pending(
+        self,
+        mock_request,
+    ):
+        mock_request.return_value = {
+            'success': True,
+            'authority': 'AUTH-SECOND-TEST',
+            'payment_url': (
+                'https://www.zarinpal.com/pg/StartPay/'
+                'AUTH-SECOND-TEST'
+            ),
+        }
+
+        first_result = initiate_payment(
+            order_id=self.order.id,
+            gateway_name='zarinpal',
+            callback_url=self.callback_url,
+            customer_email='',
+            customer_phone=self.user.phone_number,
+        )
+
+        second_result = initiate_payment(
+            order_id=self.order.id,
+            gateway_name='zarinpal',
+            callback_url=self.callback_url,
+            customer_email='',
+            customer_phone=self.user.phone_number,
+        )
+
+        self.assertTrue(first_result['success'])
+        self.assertFalse(second_result['success'])
+
+        self.assertEqual(
+            PaymentTransaction.objects.filter(
+                order=self.order,
+                status='pending',
+            ).count(),
+            1,
+        )
+
+        mock_request.assert_called_once()
+
+    @patch('payments.services.ZarinpalGateway.request_payment')
+    def test_retryable_gateway_error_keeps_reservation_pending(
+        self,
+        mock_request,
+    ):
+        mock_request.return_value = {
+            'success': False,
+            'retryable': True,
+            'error': 'ارتباط با درگاه برقرار نشد.',
+        }
+
+        first_result = initiate_payment(
+            order_id=self.order.id,
+            gateway_name='zarinpal',
+            callback_url=self.callback_url,
+            customer_email='',
+            customer_phone=self.user.phone_number,
+        )
+
+        self.assertFalse(first_result['success'])
+        self.assertTrue(first_result['retryable'])
+
+        payment = PaymentTransaction.objects.get(
+            order=self.order,
+        )
+
+        self.assertEqual(payment.status, 'pending')
+        self.assertIsNone(payment.reference_id)
+
+        second_result = initiate_payment(
+            order_id=self.order.id,
+            gateway_name='zarinpal',
+            callback_url=self.callback_url,
+            customer_email='',
+            customer_phone=self.user.phone_number,
+        )
+
+        self.assertFalse(second_result['success'])
+        mock_request.assert_called_once()
+
+    @patch('payments.services.ZarinpalGateway.request_payment')
+    def test_unexpected_gateway_exception_keeps_reservation_pending(
+        self,
+        mock_request,
+    ):
+        mock_request.side_effect = RuntimeError(
+            'Unexpected gateway error'
+        )
+
+        with self.assertRaises(RuntimeError):
+            initiate_payment(
+                order_id=self.order.id,
+                gateway_name='zarinpal',
+                callback_url=self.callback_url,
+                customer_email='',
+                customer_phone=self.user.phone_number,
+            )
+
+        payment = PaymentTransaction.objects.get(
+            order=self.order,
+        )
+
+        self.assertEqual(payment.status, 'pending')
+        self.assertIsNone(payment.reference_id)
