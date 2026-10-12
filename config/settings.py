@@ -7,7 +7,10 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.environ['SECRET_KEY']
-DEBUG = os.getenv('DEBUG', 'False') == 'True'
+DEBUG = os.getenv(
+    'DEBUG',
+    'False',
+).strip().lower() in {'true', '1', 'yes', 'on'}
 ALLOWED_HOSTS = [
     host.strip()
     for host in os.getenv('ALLOWED_HOSTS', '').split(',')
@@ -163,16 +166,20 @@ SPECTACULAR_SETTINGS = {
 }
 
 # CORS
+DEFAULT_CORS_ALLOWED_ORIGINS = (
+    'http://localhost:3000,'
+    'http://127.0.0.1:3000,'
+    'http://localhost:8000,'
+    'http://127.0.0.1:8000'
+    if DEBUG
+    else ''
+)
+
 CORS_ALLOWED_ORIGINS = [
     origin.strip().rstrip('/')
     for origin in os.getenv(
         'CORS_ALLOWED_ORIGINS',
-        (
-            'http://localhost:3000,'
-            'http://127.0.0.1:3000,'
-            'http://localhost:8000,'
-            'http://127.0.0.1:8000'
-        )
+        DEFAULT_CORS_ALLOWED_ORIGINS,
     ).split(',')
     if origin.strip()
 ]
