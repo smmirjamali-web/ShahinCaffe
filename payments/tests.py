@@ -473,14 +473,23 @@ class InitiatePaymentServiceTests(TestCase):
             'Unexpected gateway error'
         )
 
-        with self.assertRaises(RuntimeError):
-            initiate_payment(
-                order_id=self.order.id,
-                gateway_name='zarinpal',
-                callback_url=self.callback_url,
-                customer_email='',
-                customer_phone=self.user.phone_number,
+        with self.assertLogs('payments.services', level='ERROR') as captured_logs:
+            with self.assertRaises(RuntimeError):
+                initiate_payment(
+                    order_id=self.order.id,
+                    gateway_name='zarinpal',
+                    callback_url=self.callback_url,
+                    customer_email='',
+                    customer_phone=self.user.phone_number,
+                )
+
+        self.assertTrue(
+            any(
+                'Unexpected error while requesting payment'
+                in message
+                for message in captured_logs.output
             )
+        )
 
         payment = PaymentTransaction.objects.get(
             order=self.order,
