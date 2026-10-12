@@ -54,7 +54,9 @@ def initiate_payment(
             'error': 'درگاه پرداخت پشتیبانی نشده است.',
         }
 
-    gateway = ZarinpalGateway()
+    gateway = ZarinpalGateway(
+        merchant_id=gateway_config.merchant_id,
+    )
 
     if not customer_phone:
         customer_phone = order.get_customer_phone() or ''
@@ -158,7 +160,19 @@ def verify_payment(authority, amount=None):
         # مبلغ معتبر از رکورد ذخیره‌شده در دیتابیس گرفته می‌شود.
         trusted_amount = payment_transaction.amount
 
-        gateway = ZarinpalGateway()
+        gateway_config = PaymentGatewayConfig.objects.filter(
+            gateway_name=payment_transaction.gateway,
+        ).first()
+
+        if gateway_config is None or not gateway_config.merchant_id:
+            return {
+                'success': False,
+                'error': 'تنظیمات درگاه برای تأیید تراکنش موجود نیست.',
+            }
+
+        gateway = ZarinpalGateway(
+            merchant_id=gateway_config.merchant_id,
+        )
 
         result = gateway.verify_payment(
             authority,

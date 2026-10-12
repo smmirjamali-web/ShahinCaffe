@@ -9,7 +9,10 @@ from rest_framework.test import APIClient
 
 from users.models import CustomUser
 from orders.models import Order
-from payments.models import PaymentTransaction
+from payments.models import (
+    PaymentGatewayConfig,
+    PaymentTransaction,
+)
 from payments.services import verify_payment
 
 
@@ -179,6 +182,16 @@ class VerifyPaymentServiceTests(TestCase):
         self.user = CustomUser.objects.create_user(
             phone_number='09120000023',
             password='UserPass123!',
+        )
+
+        PaymentGatewayConfig.objects.create(
+            gateway_name='zarinpal',
+            merchant_id='test-merchant-id',
+            api_key='test-api-key',
+            callback_url=(
+                'http://127.0.0.1:8000/'
+                'api/payments/transactions/callback/'
+            ),
         )
 
         self.order = Order.objects.create(
