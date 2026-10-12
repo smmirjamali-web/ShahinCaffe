@@ -62,6 +62,8 @@ SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
 
+# Trust the original HTTPS scheme forwarded by the trusted proxy.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 # HTTPS settings are configured through environment variables.
 # Enable them only after confirming the production proxy configuration.
 SECURE_SSL_REDIRECT = os.getenv(
