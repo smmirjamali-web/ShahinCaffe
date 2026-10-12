@@ -72,9 +72,17 @@ class Order(models.Model):
             models.Index(fields=['user', '-created_at']),
         ]
     
+
     def __str__(self):
-        return f"سفارش #{self.id} - میز {self.table.table_number}"
-    
+        if self.table_id:
+            location = f"میز {self.table.table_number}"
+        elif self.delivery_method == 'delivery':
+            location = "تحویل درب منزل"
+        else:
+            location = "حضوری"
+
+        return f"سفارش #{self.id} - {location}"
+
     def calculate_total(self):
         """محاسبه کل مبلغ سفارش"""
         items_total = sum(item.get_total() for item in self.items.all())

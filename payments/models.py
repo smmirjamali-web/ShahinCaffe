@@ -1,4 +1,5 @@
 from django.db import models
+from django.conf import settings
 from orders.models import Order
 
 class PaymentGatewayConfig(models.Model):
@@ -94,3 +95,41 @@ class PaymentTransaction(models.Model):
 
     def __str__(self):
         return f"تراکنش {self.reference_id} - {self.amount} تومان"
+
+
+class PaymentReservationResolution(models.Model):
+    """سابقه تعیین تکلیف دستی رزرو پرداخت."""
+
+    transaction = models.OneToOneField(
+        PaymentTransaction,
+        on_delete=models.PROTECT,
+        related_name='reservation_resolution',
+        verbose_name='تراکنش پرداخت',
+    )
+
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name='payment_reservation_resolutions',
+        verbose_name='تعیین‌کننده',
+    )
+
+    reason = models.TextField(
+        verbose_name='شرح بررسی و دلیل تعیین تکلیف',
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name='زمان تعیین تکلیف',
+    )
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'سابقه تعیین تکلیف رزرو پرداخت'
+        verbose_name_plural = 'سوابق تعیین تکلیف رزروهای پرداخت'
+
+    def __str__(self):
+        return (
+            f'تعیین تکلیف رزرو تراکنش '
+            f'#{self.transaction_id}'
+        )

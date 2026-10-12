@@ -1,8 +1,11 @@
+import requests
+from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.test import Client, TestCase
 from django.urls import reverse
+from django.utils import timezone
 
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -11,9 +14,16 @@ from users.models import CustomUser
 from orders.models import Order
 from payments.models import (
     PaymentGatewayConfig,
+    PaymentReservationResolution,
     PaymentTransaction,
 )
-from payments.services import initiate_payment, verify_payment
+from payments.services import (
+    initiate_payment,
+    resolve_unreferenced_payment_reservation,
+    verify_payment,
+)
+from payments.zarinpal_gateway import ZarinpalGateway
+
 
 class PaymentAPITests(TestCase):
     """تست دسترسی کاربران به API پرداخت."""
@@ -497,3 +507,353 @@ class InitiatePaymentServiceTests(TestCase):
 
         self.assertEqual(payment.status, 'pending')
         self.assertIsNone(payment.reference_id)
+
+class ZarinpalGatewayRequestTests(TestCase):
+    """تست خطاهای مبهم هنگام درخواست پرداخت."""
+
+    def setUp(self):
+        self.gateway = ZarinpalGateway(
+            merchant_id='test-merchant-id',
+            api_url='https://example.com/api',
+        )
+
+    @patch('payments.zarinpal_gateway.requests.post')
+    def test_request_timeout_is_retryable(self, mock_post):
+        mock_post.side_effect = requests.Timeout(
+            'Connection timed out'
+        )
+
+        result = self.gateway.request_payment(
+            amount=50000,
+            order_id=123,
+            customer_email='',
+            customer_phone='09120000000',
+            callback_url='https://example.com/callback/',
+        )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['retryable'])
+
+    @patch('payments.zarinpal_gateway.requests.post')
+    def test_invalid_json_response_is_retryable(self, mock_post):
+        mock_post.return_value.json.side_effect = ValueError(
+            'Invalid JSON'
+        )
+
+        result = self.gateway.request_payment(
+            amount=50000,
+            order_id=123,
+            customer_email='',
+            customer_phone='09120000000',
+            callback_url='https://example.com/callback/',
+        )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['retryable'])
+
+
+class PaymentReservationResolutionTests(TestCase):
+    """تست تعیین تکلیف کنترل‌شده رزروهای پرداخت."""
+
+    def setUp(self):
+        self.customer = CustomUser.objects.create_user(
+            phone_number='09120000026',
+            password='CustomerPass123!',
+        )
+
+        self.admin_user = CustomUser.objects.create_user(
+            phone_number='09120000027',
+            password='AdminPass123!',
+            is_staff=True,
+        )
+
+        self.order = Order.objects.create(
+            user=self.customer,
+            delivery_method='delivery',
+            delivery_address='Test Street',
+            total_amount=Decimal('50000'),
+        )
+
+        self.payment = PaymentTransaction.objects.create(
+            order=self.order,
+            gateway='zarinpal',
+            reference_id=None,
+            amount=Decimal('50000'),
+            status='pending',
+            customer_phone=self.customer.phone_number,
+            error_message=(
+                'ارتباط با درگاه برقرار نشد؛ '
+                'نتیجه درخواست نامشخص است.'
+            ),
+        )
+
+        # ایجاد رزرو قدیمی برای تست شرط گذشت زمان.
+        PaymentTransaction.objects.filter(
+            pk=self.payment.pk,
+        ).update(
+            created_at=timezone.now() - timedelta(minutes=11),
+        )
+
+        self.reason = (
+            'پنل پذیرنده بررسی شد و عدم ثبت درخواست '
+            'برای این رزرو تأیید شد.'
+        )
+
+    def resolve(self, **overrides):
+        params = {
+            'transaction_id': self.payment.pk,
+            'resolved_by': self.admin_user,
+            'reason': self.reason,
+            'confirmed_not_registered': True,
+        }
+        params.update(overrides)
+
+        return resolve_unreferenced_payment_reservation(
+            **params,
+        )
+
+    def test_admin_can_resolve_valid_old_reservation(self):
+        result = self.resolve()
+
+        self.assertTrue(result['success'])
+
+        self.payment.refresh_from_db()
+
+        self.assertEqual(self.payment.status, 'failed')
+
+        resolution = PaymentReservationResolution.objects.get(
+            transaction=self.payment,
+        )
+
+        self.assertEqual(
+            resolution.resolved_by,
+            self.admin_user,
+        )
+        self.assertEqual(resolution.reason, self.reason)
+
+    def test_non_staff_user_cannot_resolve_reservation(self):
+        result = self.resolve(
+            resolved_by=self.customer,
+        )
+
+        self.assertFalse(result['success'])
+
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, 'pending')
+
+        self.assertFalse(
+            PaymentReservationResolution.objects.filter(
+                transaction=self.payment,
+            ).exists()
+        )
+
+    def test_recent_reservation_cannot_be_resolved(self):
+        PaymentTransaction.objects.filter(
+            pk=self.payment.pk,
+        ).update(
+            created_at=timezone.now(),
+        )
+
+        result = self.resolve()
+
+        self.assertFalse(result['success'])
+
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, 'pending')
+
+    def test_transaction_with_authority_cannot_be_resolved(self):
+        self.payment.reference_id = 'AUTH-RESOLUTION-TEST'
+        self.payment.save(update_fields=['reference_id'])
+
+        result = self.resolve()
+
+        self.assertFalse(result['success'])
+
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, 'pending')
+
+    def test_paid_order_cannot_have_reservation_released(self):
+        self.order.payment_status = 'paid'
+        self.order.save(update_fields=['payment_status'])
+
+        result = self.resolve()
+
+        self.assertFalse(result['success'])
+
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, 'pending')
+
+    def test_duplicate_authority_conflict_requires_separate_review(self):
+        self.payment.error_message = (
+            'شناسه دریافتی از درگاه تکراری است؛ '
+            'نیاز به بررسی دستی دارد.'
+        )
+        self.payment.save(update_fields=['error_message'])
+
+        result = self.resolve()
+
+        self.assertFalse(result['success'])
+
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, 'pending')
+
+    def test_resolution_requires_reason_and_explicit_confirmation(self):
+        short_reason_result = self.resolve(reason='بررسی شد')
+
+        self.assertFalse(short_reason_result['success'])
+
+        unconfirmed_result = self.resolve(
+            confirmed_not_registered=False,
+        )
+
+        self.assertFalse(unconfirmed_result['success'])
+
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, 'pending')
+
+        self.assertFalse(
+            PaymentReservationResolution.objects.filter(
+                transaction=self.payment,
+            ).exists()
+        )
+
+
+class PaymentReservationAdminTests(TestCase):
+    """تست فرم مدیریتی تعیین تکلیف رزرو پرداخت."""
+
+    def setUp(self):
+        self.customer = CustomUser.objects.create_user(
+            phone_number='09120000028',
+            password='CustomerPass123!',
+        )
+
+        self.admin_user = CustomUser.objects.create_superuser(
+            phone_number='09120000029',
+            email='admin@example.com',
+            password='AdminPass123!',
+        )
+
+        self.order = Order.objects.create(
+            user=self.customer,
+            delivery_method='delivery',
+            delivery_address='Test Street',
+            total_amount=Decimal('50000'),
+        )
+
+        self.payment = PaymentTransaction.objects.create(
+            order=self.order,
+            gateway='zarinpal',
+            reference_id=None,
+            amount=Decimal('50000'),
+            status='pending',
+            customer_phone=self.customer.phone_number,
+            error_message='ارتباط با درگاه برقرار نشد.',
+        )
+
+        PaymentTransaction.objects.filter(
+            pk=self.payment.pk,
+        ).update(
+            created_at=timezone.now() - timedelta(minutes=11),
+        )
+
+        self.resolve_url = reverse(
+            'admin:payments_paymenttransaction_resolve_reservation',
+            args=[self.payment.pk],
+        )
+
+        self.change_url = reverse(
+            'admin:payments_paymenttransaction_change',
+            args=[self.payment.pk],
+        )
+
+        self.client = Client()
+
+    def test_anonymous_user_cannot_open_resolution_form(self):
+        response = self.client.get(self.resolve_url)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(
+            reverse('admin:login'),
+            response.url,
+        )
+
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, 'pending')
+
+    def test_admin_can_open_resolution_form(self):
+        self.client.force_login(self.admin_user)
+
+        response = self.client.get(self.resolve_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'اطلاعات تراکنش')
+        self.assertContains(
+            response,
+            'پنل رسمی پذیرنده',
+        )
+
+    def test_admin_post_records_resolution_and_redirects(self):
+        self.client.force_login(self.admin_user)
+
+        reason = (
+            'پنل پذیرنده بررسی شد و عدم ثبت درخواست '
+            'برای این رزرو تأیید شد.'
+        )
+
+        response = self.client.post(
+            self.resolve_url,
+            {
+                'reason': reason,
+                'confirmed_not_registered': 'on',
+            },
+        )
+
+        self.assertRedirects(
+            response,
+            self.change_url,
+        )
+
+        self.payment.refresh_from_db()
+
+        self.assertEqual(
+            self.payment.status,
+            'failed',
+        )
+
+        resolution = PaymentReservationResolution.objects.get(
+            transaction=self.payment,
+        )
+
+        self.assertEqual(
+            resolution.resolved_by,
+            self.admin_user,
+        )
+        self.assertEqual(resolution.reason, reason)
+
+    def test_missing_confirmation_does_not_resolve_payment(self):
+        self.client.force_login(self.admin_user)
+
+        response = self.client.post(
+            self.resolve_url,
+            {
+                'reason': (
+                    'این شرح برای بررسی رزرو پرداخت '
+                    'و ثبت گزارش مدیریتی است.'
+                ),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.payment.refresh_from_db()
+
+        self.assertEqual(
+            self.payment.status,
+            'pending',
+        )
+
+        self.assertFalse(
+            PaymentReservationResolution.objects.filter(
+                transaction=self.payment,
+            ).exists()
+        )

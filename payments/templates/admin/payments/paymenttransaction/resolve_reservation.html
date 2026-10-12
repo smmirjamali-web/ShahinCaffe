@@ -1,0 +1,38 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<div id="content-main">
+    <p>
+        این عملیات فقط پس از بررسی پنل رسمی پذیرنده و اطمینان از
+        ثبت‌نشدن درخواست پرداخت مجاز است. گذشت زمان به‌تنهایی
+        دلیل آزادسازی رزرو نیست.
+    </p>
+
+    <div class="module">
+        <h2>اطلاعات تراکنش</h2>
+        <div class="padded">
+            <p><strong>شناسه تراکنش:</strong> {{ transaction.pk }}</p>
+            <p><strong>سفارش:</strong> {{ transaction.order_id }}</p>
+            <p><strong>مبلغ:</strong> {{ transaction.amount }} تومان</p>
+            <p><strong>وضعیت فعلی:</strong> {{ transaction.get_status_display }}</p>
+            <p><strong>زمان ایجاد:</strong> {{ transaction.created_at }}</p>
+            <p><strong>آخرین خطا:</strong> {{ transaction.error_message|default:"ثبت نشده" }}</p>
+        </div>
+    </div>
+
+    <form method="post" novalidate>
+        {% csrf_token %}
+
+        {{ form.as_p }}
+
+        <div class="submit-row">
+            <input
+                type="submit"
+                value="ثبت بررسی و تعیین تکلیف رزرو"
+                class="default"
+            >
+            <a href="{{ back_url }}" class="closelink">انصراف</a>
+        </div>
+    </form>
+</div>
+{% endblock %}

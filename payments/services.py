@@ -4,7 +4,7 @@ from datetime import timedelta
 from django.db import IntegrityError, transaction as db_transaction
 from django.utils import timezone
 
-from .models import PaymentGatewayConfig, PaymentTransaction
+from .models import PaymentGatewayConfig, PaymentTransaction, PaymentReservationResolution
 from .zarinpal_gateway import ZarinpalGateway
 from orders.models import Order
 
@@ -520,6 +520,199 @@ def verify_payment(authority, amount=None):
             'order_id': order.id,
             'already_verified': False,
         }
+
+
+def resolve_unreferenced_payment_reservation(
+    transaction_id,
+    resolved_by,
+    reason,
+    *,
+    confirmed_not_registered=False,
+):
+    """
+    آزادسازی کنترل‌شده رزرو پرداخت پس از بررسی دستی درگاه.
+
+    فقط تراکنش معلقی قابل تعیین تکلیف است که:
+    - هنوز شناسه درگاه ندارد.
+    - نتیجه درخواست قبلی در دیتابیس ثبت شده است.
+    - حداقل ۱۰ دقیقه از ایجاد آن گذشته است.
+    - کاربر فعال و دارای دسترسی مدیریتی باشد.
+    - عدم ثبت درخواست در درگاه به‌صورت دستی تأیید شده باشد.
+    """
+
+    reason = (reason or '').strip()
+
+    if (
+        not getattr(resolved_by, 'is_authenticated', False)
+        or not getattr(resolved_by, 'is_active', False)
+        or not (
+            getattr(resolved_by, 'is_staff', False)
+            or getattr(resolved_by, 'is_superuser', False)
+        )
+    ):
+        return {
+            'success': False,
+            'error': 'فقط کاربر مدیریتی فعال مجاز به این عملیات است.',
+        }
+
+    if len(reason) < 20:
+        return {
+            'success': False,
+            'error': 'شرح بررسی باید حداقل ۲۰ نویسه داشته باشد.',
+        }
+
+    if confirmed_not_registered is not True:
+        return {
+            'success': False,
+            'error': (
+                'ابتدا باید بررسی دستی درگاه و عدم ثبت درخواست '
+                'تأیید شود.'
+            ),
+        }
+
+    try:
+        order_id = PaymentTransaction.objects.values_list(
+            'order_id',
+            flat=True,
+        ).get(pk=transaction_id)
+    except PaymentTransaction.DoesNotExist:
+        return {
+            'success': False,
+            'error': 'تراکنش پرداخت یافت نشد.',
+        }
+
+    with db_transaction.atomic():
+        # ترتیب قفل‌ها با منطق پرداخت هماهنگ است:
+        # ابتدا سفارش، سپس تراکنش.
+        try:
+            order = Order.objects.select_for_update().get(
+                pk=order_id,
+            )
+
+            payment = (
+                PaymentTransaction.objects
+                .select_for_update()
+                .get(
+                    pk=transaction_id,
+                    order_id=order_id,
+                )
+            )
+        except (
+            Order.DoesNotExist,
+            PaymentTransaction.DoesNotExist,
+        ):
+            return {
+                'success': False,
+                'error': 'سفارش یا تراکنش پرداخت یافت نشد.',
+            }
+
+        if payment.status != 'pending':
+            return {
+                'success': False,
+                'error': 'تراکنش دیگر در وضعیت معلق نیست.',
+            }
+
+        if payment.reference_id:
+            return {
+                'success': False,
+                'error': (
+                    'این تراکنش شناسه درگاه دارد؛ '
+                    'باید وضعیت آن از طریق درگاه بررسی شود.'
+                ),
+            }
+
+        if order.payment_status != 'unpaid':
+            return {
+                'success': False,
+                'error': (
+                    'وضعیت پرداخت سفارش اجازه آزادسازی رزرو را نمی‌دهد.'
+                ),
+            }
+
+        if PaymentTransaction.objects.filter(
+            order_id=order.id,
+            status='success',
+        ).exists():
+            return {
+                'success': False,
+                'error': (
+                    'برای این سفارش سابقه پرداخت موفق وجود دارد؛ '
+                    'بررسی دستی بیشتری لازم است.'
+                ),
+            }
+
+        if (
+            payment.created_at
+            > timezone.now() - timedelta(minutes=10)
+        ):
+            return {
+                'success': False,
+                'error': (
+                    'حداقل ۱۰ دقیقه از ایجاد رزرو نگذشته است.'
+                ),
+            }
+
+        # اگر نتیجه درخواست قبلی اصلاً در دیتابیس ثبت نشده باشد،
+        # ممکن است فرایند درخواست هنوز فعال یا متوقف‌شده باشد.
+        if not payment.error_message.strip():
+            return {
+                'success': False,
+                'error': (
+                    'نتیجه درخواست قبلی ثبت نشده است؛ '
+                    'این رزرو با این روش قابل آزادسازی نیست.'
+                ),
+            }
+
+        # تعارض شناسه درگاه وضعیت ویژه‌ای است و به بررسی جداگانه نیاز دارد.
+        if (
+            'شناسه دریافتی از درگاه تکراری است'
+            in payment.error_message
+            or (
+                isinstance(payment.gateway_response, dict)
+                and payment.gateway_response.get(
+                    'duplicate_authority'
+                )
+            )
+        ):
+            return {
+                'success': False,
+                'error': (
+                    'تعارض شناسه درگاه وجود دارد؛ '
+                    'این تراکنش به بررسی جداگانه نیاز دارد.'
+                ),
+            }
+
+        if PaymentReservationResolution.objects.filter(
+            transaction_id=payment.id,
+        ).exists():
+            return {
+                'success': False,
+                'error': 'برای این تراکنش سابقه تعیین تکلیف ثبت شده است.',
+            }
+
+        resolution = PaymentReservationResolution.objects.create(
+            transaction=payment,
+            resolved_by=resolved_by,
+            reason=reason,
+        )
+
+        payment.status = 'failed'
+        payment.error_message = (
+            f'{payment.error_message.strip()}\n\n'
+            'رزرو پس از بررسی دستی و تأیید عدم ثبت درخواست '
+            'در درگاه، آزاد شد.'
+        )
+        payment.save(
+            update_fields=['status', 'error_message'],
+        )
+
+        return {
+            'success': True,
+            'transaction_id': payment.id,
+            'order_id': order.id,
+            'resolution_id': resolution.id,
+        }
+
 
 def _send_payment_notification(order_id):
     """ارسال اعلان پرداخت پس از ثبت تراکنش."""

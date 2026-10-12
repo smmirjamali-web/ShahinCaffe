@@ -68,17 +68,24 @@ class ZarinpalGateway:
             )
 
             result = response.json()
-
         except requests.RequestException:
             return {
                 'success': False,
-                'error': 'ارتباط با درگاه پرداخت برقرار نشد.',
+                'retryable': True,
+                'error': (
+                    'ارتباط با درگاه پرداخت برقرار نشد؛ '
+                    'نتیجه درخواست نامشخص است.'
+                ),
             }
 
         except ValueError:
             return {
                 'success': False,
-                'error': 'پاسخ دریافتی از درگاه معتبر نیست.',
+                'retryable': True,
+                'error': (
+                    'پاسخ دریافتی از درگاه معتبر نیست؛ '
+                    'نتیجه درخواست نامشخص است.'
+                ),
             }
 
         if not response.ok:
