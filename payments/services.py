@@ -353,6 +353,7 @@ def verify_payment(authority, amount=None):
 
         verification_started_at = payment_transaction.verification_started_at
         payment_transaction_id = payment_transaction.id
+        payment_order_id = payment_transaction.order_id
         merchant_id = gateway_config.merchant_id
 
     # مرحله دوم: تماس با درگاه بدون نگه‌داشتن قفل دیتابیس.
@@ -396,16 +397,22 @@ def verify_payment(authority, amount=None):
     # مرحله سوم: ثبت نتیجه در یک تراکنش کوتاه دیگر.
     with db_transaction.atomic():
         try:
+            # ترتیب قفل‌ها باید با initiate_payment یکسان باشد:
+            # ابتدا سفارش، سپس تراکنش پرداخت.
+            order = Order.objects.select_for_update().get(
+                pk=payment_order_id
+            )
+
             payment_transaction = (
                 PaymentTransaction.objects
                 .select_for_update()
-                .select_related('order')
                 .get(pk=payment_transaction_id)
             )
-        except PaymentTransaction.DoesNotExist:
+
+        except (Order.DoesNotExist, PaymentTransaction.DoesNotExist):
             return {
                 'success': False,
-                'error': 'تراکنش پرداخت یافت نشد.',
+                'error': 'سفارش یا تراکنش پرداخت یافت نشد.',
             }
 
         if payment_transaction.status == 'success':
@@ -491,8 +498,6 @@ def verify_payment(authority, amount=None):
                 'gateway_response',
             ]
         )
-
-        order = payment_transaction.order
 
         if order.payment_status != 'paid':
             order.payment_status = 'paid'
