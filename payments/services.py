@@ -78,26 +78,31 @@ def initiate_payment(
             )
 
             if pending_payment:
-                if pending_payment.reference_id is None:
-                    # ممکن است درخواست قبلی به درگاه رسیده باشد اما
-                    # پاسخ آن دریافت یا ذخیره نشده باشد. انقضای خودکار
-                    # این رزرو می‌تواند باعث دریافت دوباره وجه شود.
+                # اگر شناسه درگاه وجود دارد، همان پرداخت را ادامه بده.
+                # برای این سفارش درخواست پرداخت جدید نمی‌سازیم.
+                if pending_payment.reference_id:
                     return {
-                        'success': False,
-                        'error': (
-                            'نتیجه درخواست قبلی مشخص نیست؛ '
-                            'برای جلوگیری از پرداخت تکراری، '
-                            'ابتدا باید تراکنش قبلی بررسی شود.'
+                        'success': True,
+                        'transaction_id': pending_payment.id,
+                        'authority': pending_payment.reference_id,
+                        'payment_url': (
+                            'https://www.zarinpal.com/pg/StartPay/'
+                            f'{pending_payment.reference_id}'
                         ),
+                        'reused': True,
                     }
 
+                # اگر هنوز شناسه درگاه نداریم، معلوم نیست درخواست قبلی
+                # در سمت درگاه ثبت شده یا نه؛ بنابراین پرداخت دوم نساز.
                 return {
                     'success': False,
+                    'retryable': True,
                     'error': (
-                        'برای این سفارش یک پرداخت در حال انجام است.'
+                        'نتیجه درخواست پرداخت قبلی هنوز مشخص نیست. '
+                        'برای جلوگیری از پرداخت تکراری، درخواست جدید '
+                        'ایجاد نشد و این تراکنش نیاز به بررسی دارد.'
                     ),
                 }
-
             # پیش از تماس با درگاه، یک تراکنش رزرو می‌کنیم.
             # شناسه درگاه پس از دریافت پاسخ ثبت خواهد شد.
             payment_transaction = PaymentTransaction.objects.create(

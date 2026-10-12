@@ -369,8 +369,9 @@ class InitiatePaymentServiceTests(TestCase):
 
         mock_request.assert_called_once()
 
+
     @patch('payments.services.ZarinpalGateway.request_payment')
-    def test_second_initiation_is_rejected_while_pending(
+    def test_second_initiation_reuses_existing_pending_payment(
         self,
         mock_request,
     ):
@@ -400,7 +401,18 @@ class InitiatePaymentServiceTests(TestCase):
         )
 
         self.assertTrue(first_result['success'])
-        self.assertFalse(second_result['success'])
+        self.assertTrue(second_result['success'])
+        self.assertTrue(second_result['reused'])
+
+        self.assertEqual(
+            second_result['authority'],
+            first_result['authority'],
+        )
+
+        self.assertEqual(
+            second_result['payment_url'],
+            first_result['payment_url'],
+        )
 
         self.assertEqual(
             PaymentTransaction.objects.filter(
