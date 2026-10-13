@@ -26,3 +26,6 @@ staticfiles/
 # OS
 .DS_Store
 Thumbs.db
+
+# Generated static files on persistent storage
+/public/
